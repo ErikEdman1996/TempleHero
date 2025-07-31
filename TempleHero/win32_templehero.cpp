@@ -22,12 +22,15 @@
 #include <windows.h>
 #include <stdint.h>
 #include <xinput.h>
-#include <xaudio2.h>
+#include <math.h>
+#include <dsound.h>
 #include "templehero.h"
 
 #define internal static
 #define local_persist static
 #define global_variable static
+
+const global_variable double PI = 3.14159265358979323846;
 
 struct win32_offscreen_buffer
 {
@@ -61,6 +64,10 @@ X_INPUT_SET_STATE(XInputSetStateStub)
 	return ERROR_DEVICE_NOT_CONNECTED;
 }
 
+//Note: DirectSoundCreate
+#define DIRECT_SOUND_CREATE(name) HRESULT WINAPI name(LPCGUID pcGuidDevice, LPDIRECTSOUND* ppDS, LPUNKNOWN pUnkOuter)
+typedef DIRECT_SOUND_CREATE(direct_sound_create);
+
 global_variable x_input_get_state* XInputGetState_ = XInputGetStateStub;
 global_variable x_input_set_state* XInputSetState_ = XInputSetStateStub;
 
@@ -79,6 +86,8 @@ internal win32_window_dimension Win32GetWindowDimension(HWND window);
 internal void Win32ResizeDIBSection(win32_offscreen_buffer& buffer, int width, int height);
 
 internal void Win32DisplayBufferInWindow(win32_offscreen_buffer buffer, HDC deviceContext, int windowWidth, int windowHeight, int x, int y, int width, int height);
+
+internal void Win32InitDSound(HWND *window, int32_t samplesPerSecond, int32_t bufferSize);
 
 LRESULT Win32MainWindowCallback(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
 
@@ -124,6 +133,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prevInstance, PWSTR commandLin
 					);
 		if (windowHandle)
 		{
+
+			Win32InitDSound(&windowHandle, 48000, 48000*sizeof(int16_t)*2);
+
 			RUNNING = true;
 
 			int xOffset = 0;
@@ -253,7 +265,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prevInstance, PWSTR commandLin
 
 internal void BeforeClosingApp()
 {
-
+	OutputDebugStringA("Application is closing.\n");
 }
 
 internal win32_window_dimension Win32GetWindowDimension(HWND window)
@@ -434,4 +446,107 @@ void Win32LoadXinput(void)
 
 	if (!XInputGetState) { XInputGetState = XInputGetStateStub; }
 	if (!XInputSetState) { XInputSetState = XInputSetStateStub; }
+}
+
+internal void Win32InitDSound(HWND *window, int32_t samplesPerSecond, int32_t bufferSize)
+{
+	// Load the library
+	HMODULE dsoundLibrary = LoadLibraryW(L"dsound.dll");
+
+	if (!dsoundLibrary)
+	{
+		OutputDebugStringA("Failed to load dsound.dll\n");
+		return;
+	}
+
+	direct_sound_create* directSoundCreate = (direct_sound_create*)GetProcAddress(dsoundLibrary, "DirectSoundCreate8");
+
+	if (!directSoundCreate)
+	{
+		OutputDebugStringA("Failed to get DirectSoundCreate function address.\n");
+		return;
+	}
+
+	LPDIRECTSOUND directSound;
+
+	HRESULT hr = directSoundCreate(0, &directSound, 0);
+
+	if (FAILED(hr))
+	{
+		OutputDebugStringA("Failed to create DirectSound object\n");
+		return;
+	}
+
+	// Set cooperative level to allow format changes
+	if (FAILED(directSound->SetCooperativeLevel(*window, DSSCL_PRIORITY)))
+	{
+		OutputDebugStringA("Failed to set cooperative level\n");
+		return;
+	}
+
+	//Set Wave Format
+	WAVEFORMATEX waveFormat = {};
+	waveFormat.wFormatTag = WAVE_FORMAT_PCM; // PCM format
+	waveFormat.nChannels = 2; // Stereo
+	waveFormat.nSamplesPerSec = samplesPerSecond; // Sample rate
+	waveFormat.wBitsPerSample = 16;
+	waveFormat.nBlockAlign = (waveFormat.nChannels * waveFormat.wBitsPerSample) / 8;
+	waveFormat.nAvgBytesPerSec = waveFormat.nSamplesPerSec * waveFormat.nBlockAlign;
+	waveFormat.cbSize = 0; // No extra data
+
+	// Describe the buffer
+	DSBUFFERDESC bufferDesc = {};
+	bufferDesc.dwSize = sizeof(DSBUFFERDESC);
+	bufferDesc.dwFlags = DSBCAPS_PRIMARYBUFFER;
+	bufferDesc.dwBufferBytes = 0;
+	bufferDesc.lpwfxFormat = NULL;
+
+	//*Create* a primary sound buffer
+	LPDIRECTSOUNDBUFFER primaryBuffer;
+
+	hr = directSound->CreateSoundBuffer(&bufferDesc, &primaryBuffer, NULL);
+
+	if (FAILED(hr))
+	{
+		OutputDebugStringA("Failed to create primary sound buffer.\n");
+		return;
+	}
+
+	hr = primaryBuffer->SetFormat(&waveFormat);
+
+	if(FAILED(hr))
+	{
+		OutputDebugStringA("Failed to set format on primary sound buffer.\n");
+		return;
+	}
+
+	// Create the secondary buffer
+	DSBUFFERDESC secondaryBufferDesc = {};
+	secondaryBufferDesc.dwSize = sizeof(DSBUFFERDESC);
+	secondaryBufferDesc.dwFlags = DSBCAPS_GETCURRENTPOSITION2; // Better position accuracy
+	secondaryBufferDesc.dwBufferBytes = bufferSize;
+	secondaryBufferDesc.lpwfxFormat = &waveFormat;
+
+	LPDIRECTSOUNDBUFFER secondaryBuffer;
+
+	hr = directSound->CreateSoundBuffer(&secondaryBufferDesc, &secondaryBuffer, NULL);
+
+	if (FAILED(hr))
+	{
+		OutputDebugStringA("Failed to create secondary sound buffer.\n");
+		return;
+	}
+
+	// Optionally zero out the buffer to avoid noise at startup
+	VOID* region1;
+	DWORD region1Size;
+	VOID* region2;
+	DWORD region2Size;
+
+	if (SUCCEEDED(secondaryBuffer->Lock(0, bufferSize, &region1, &region1Size, &region2, &region2Size, 0)))
+	{
+		ZeroMemory(region1, region1Size);
+		ZeroMemory(region2, region2Size);
+		secondaryBuffer->Unlock(region1, region1Size, region2, region2Size);
+	}
 }
